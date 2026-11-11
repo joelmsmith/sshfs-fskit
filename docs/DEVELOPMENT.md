@@ -42,6 +42,33 @@ scripts/build-adhoc.sh      # no Apple account: works, but no kernel cache inval
 
 ### Releases
 
+Releases are built on GitHub, never uploaded from a local machine:
+
+1. Set `MARKETING_VERSION` in `SSHFS.xcodeproj/project.pbxproj` (both
+   configurations), commit, and push a matching tag: `git tag v0.2 &&
+   git push origin v0.2`.
+2. `.github/workflows/release.yml` runs on the `xcode-27` runner: it checks
+   the tag against the version, runs `build-release.sh` (`INSTALL=0`),
+   attests the zip's build provenance and creates a **draft** release with
+   the zip, its SHA-256 and how to verify it
+   (`gh attestation verify SSHFS.zip --repo OWNER/REPO`).
+3. Download the draft's zip, install it, run `scripts/e2e.sh` against it,
+   then publish the draft.
+
+The workflow needs these secrets in the repository's `release` environment
+(Settings → Environments; restrict it to `v*` tags and require a reviewer):
+
+| Secret | Content |
+|---|---|
+| `DEVID_P12_BASE64` | Developer ID Application identity (key, certificate, Apple's G2 intermediate) as a base64 .p12 |
+| `DEVID_P12_PASSWORD` | its password |
+| `DEVID_PROFILE_BASE64` | the Developer ID provisioning profile for the extension, base64 |
+| `ASC_KEY_ID`, `ASC_ISSUER_ID` | an App Store Connect API key for notarization (Developer role is enough) |
+| `ASC_KEY_P8_BASE64` | that key's .p8 file, base64 |
+
+Locally, `build-release.sh` does the same and installs the result; such
+builds are for testing.
+
 - `build-release.sh` signs with Developer ID, notarizes, staples and zips.
   The zip carries no extended attributes, so it survives plain `unzip`
   (with them, `unzip` leaves `._*` files in the bundle and macOS reports

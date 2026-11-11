@@ -33,4 +33,6 @@ the system `ssh`. No kernel extension, no macFUSE.
   launchd plist.
 - `scripts/`: build-{signed,release,adhoc}.sh, install.sh, e2e.sh, test.sh,
   asc.py (App Store Connect API).
+- `.github/workflows/release.yml`: builds, notarizes and drafts a release
+  for a pushed `v*` tag (DEVELOPMENT.md, "Releases").
 - `SSHFS.xcodeproj`: hand-written; folders are synchronized groups.

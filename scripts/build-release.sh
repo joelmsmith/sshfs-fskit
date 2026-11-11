@@ -5,12 +5,16 @@
 # to /Applications on this Mac.
 #
 #   SIGNING_DIR  holds the Developer ID profile and asc.env (default ~/sshfs-signing)
+#   PROFILE      the Developer ID profile (default $SIGNING_DIR/SSHFS_fsmodule_devid.provisionprofile)
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH
+#                App Store Connect API key for notarytool; read from
+#                $SIGNING_DIR/asc.env when not set (see scripts/asc.py)
 #   NOTARIZE=0   skip notarization (checks signing only: an un-notarized
 #                build can't start the ssh helper, so it can't mount)
+#   INSTALL=0    don't install to /Applications (CI)
 #
-# Needs in the keychain: the "Developer ID Application" identity of team
-# 7J29265W8G. Needs in SIGNING_DIR: SSHFS_fsmodule_devid.provisionprofile and
-# asc.env (App Store Connect API key, see scripts/asc.py) for notarytool.
+# Needs in the keychain search list: the "Developer ID Application" identity
+# of team 7J29265W8G. .github/workflows/release.yml runs this on GitHub.
 set -e
 cd "$(dirname "$0")/.."
 SIGNING_DIR=${SIGNING_DIR:-$HOME/sshfs-signing}
@@ -35,7 +39,7 @@ codesign --verify --strict --deep --verbose=1 "$APP"
 ZIP=$PWD/build/SSHFS.zip
 rm -f "$ZIP"
 if [ "${NOTARIZE:-1}" = 1 ]; then
-    set -a; . "$SIGNING_DIR/asc.env"; set +a
+    if [ -z "${ASC_KEY_ID:-}" ]; then set -a; . "$SIGNING_DIR/asc.env"; set +a; fi
     ditto -c -k --keepParent "$APP" "$ZIP"
     # On any failure here remove the zip: it is only the upload (not
     # stapled, and with extended attributes that break plain unzip).
@@ -54,5 +58,5 @@ unzip -q "$ZIP" -d "$CHECK"
 codesign --verify --strict --deep "$CHECK/SSHFS.app" || { echo "the zip doesn't survive unzip" >&2; exit 1; }
 [ "${NOTARIZE:-1}" != 1 ] || spctl --assess --type execute "$CHECK/SSHFS.app" || { echo "the unzipped app fails Gatekeeper" >&2; exit 1; }
 rm -rf "$CHECK"
-scripts/install.sh "$APP"
+[ "${INSTALL:-1}" = 0 ] || scripts/install.sh "$APP"
 echo "$ZIP"
