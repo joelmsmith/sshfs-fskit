@@ -10,6 +10,13 @@ struct OpenHandle: Sendable {
     let task: Task<Handle, any Error>
 }
 
+extension OpenHandle {
+    /// A handle that is already open.
+    init(generation: UInt64, handle: Handle) {
+        self.init(generation: generation, task: Task { handle })
+    }
+}
+
 /// A file or directory on the remote side, as FSKit sees it.
 ///
 /// SFTP v3 has no inode numbers, so identity is by path: the table hands out
@@ -24,9 +31,15 @@ final class SFTPItem: FSItem, @unchecked Sendable {
         var lastAttributes: FileAttributes?
         /// Directory listing snapshot for paged enumeration.
         var listing: (verifier: UInt64, entries: [DirectoryEntry])?
-        /// Open SFTP handles, shared by concurrent readers/writers.
+        /// Open SFTP handles, shared by concurrent readers/writers. While the
+        /// kernel has a regular file open for writing there is a write handle
+        /// (from the create or the open; it reads too): like a descriptor, it
+        /// keeps working whatever happens to the file's mode meanwhile.
         var readHandle: OpenHandle?
         var writeHandle: OpenHandle?
+        /// The file's mode while it has owner-write added to get a write
+        /// handle back (SSHVolume.openForWriting); nil once it's restored.
+        var modeToRestore: UInt32?
         var openModes: FSVolume.OpenModes = []
         /// What the kernel was last allowed to cache for this item.
         var cacheMode: FSVolume.DataCacheMode = .none

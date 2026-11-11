@@ -244,7 +244,7 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
     private func observe(_ a: FileAttributes, for item: SFTPItem, invalidate: Bool = true) -> Bool {
         let changed = item.withState { s -> Bool in
             defer { s.lastAttributes = a; s.type = a.type }
-            guard let old = s.lastAttributes, s.writeHandle == nil else { return false }
+            guard let old = s.lastAttributes, s.io.writes == 0 else { return false }
             return old.modifyTime != a.modifyTime || old.size != a.size
         }
         if changed && invalidate { invalidateKernelCache(item) }
@@ -423,12 +423,17 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             guard let dir = directory as? SFTPItem else { throw fs_errorForPOSIXError(EINVAL) }
             let path = try newEntryPath(in: directory, name)
             let mode = newAttributes.isValid(.mode) ? newAttributes.mode & 0o7777 : nil
+            // The handle a file is created with can read and write it whatever
+            // its mode (git creates objects 0444, then writes them), so it is
+            // kept for the open that follows; a later open by path would be
+            // refused.
+            var created: OpenHandle?
             switch type {
             case .file:
-                try await remote.run(idempotent: false) {
-                    let h = try await $0.client.open(path, flags: [.write, .create, .exclusive],
+                created = try await remote.run(idempotent: false) {
+                    let h = try await $0.client.open(path, flags: [.read, .write, .create, .exclusive],
                                                      attributes: FileAttributes(permissions: mode ?? 0o644))
-                    try await $0.client.close(h)
+                    return OpenHandle(generation: $0.generation, handle: h)
                 }
             case .directory:
                 try await remote.run(idempotent: false) {
@@ -438,12 +443,26 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
                 throw fs_errorForPOSIXError(ENOTSUP)
             }
             table.invalidate(dir.path)
-            let a = try await attributes(of: path, fresh: true)
-            let item = table.item(for: path, type: a.type)
-            return try require(FSCreateItemResult(newItem: item, newItemName: name,
-                                                  newItemAttributes: fsAttributes(a, path: path),
-                                                  directoryAttributes: try await currentAttributes(of: dir, fresh: true),
-                                                  freeSpace: nil))
+            do {
+                let a = try await attributes(of: path, fresh: true)
+                let item = table.item(for: path, type: a.type)
+                let result = try require(FSCreateItemResult(newItem: item, newItemName: name,
+                                                            newItemAttributes: fsAttributes(a, path: path),
+                                                            directoryAttributes: try await currentAttributes(of: dir, fresh: true),
+                                                            freeSpace: nil))
+                if let created {
+                    // Closed by the item's close, or its reclaim if the
+                    // kernel never opens it.
+                    item.withState { s in
+                        if let stale = s.writeHandle { s.retired.append(stale) }
+                        s.writeHandle = created
+                    }
+                }
+                return result
+            } catch {
+                if let created { await closeHandles([created]) }
+                throw error
+            }
         } catch { throw error.posix }
     }
 
@@ -573,17 +592,38 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
 
     /// Close-to-open consistency (like NFS): every open revalidates with the
     /// server, and drops the kernel's cached pages if the file changed.
+    ///
+    /// An open for writing also gets its SFTP handle now rather than at the
+    /// first write. The kernel buffers writes, so that is the last moment a
+    /// refusal can reach the app as a failed open(2) instead of data lost
+    /// at close; and like the app's descriptor, the handle outlives later
+    /// changes to the file's mode. (The kernel calls this again, with all
+    /// the modes, when a file open for reading is opened for writing too.)
     func open(_ item: FSItem, modes: FSVolume.OpenModes, cacheMode: FSVolume.DataCacheMode,
               context: FSContext) async throws -> FSOpenItemResult {
         do {
             guard let item = item as? SFTPItem else { throw fs_errorForPOSIXError(EINVAL) }
             if item.type != .directory {
-                let a = try await attributes(of: item.path, fresh: true)
-                if observe(a, for: item, invalidate: false) {
-                    // Drop stale pages before the kernel reads through this
-                    // open. Bounded in case the kernel waits on this very open.
-                    let done = await boundedWait(invalidateKernelCache(item), limit: .seconds(1))
-                    if done == nil { log.error("invalidate during open timed out: \(item.path, privacy: .public)") }
+                // Alongside the lstat: no extra round trip.
+                let opening: Task<Void, any Error>? = modes.contains(.write) && item.type == .regular ? Task {
+                    try await self.remote.run { session in
+                        _ = try await self.openHandle(for: item, write: true, session: session)
+                    }
+                } : nil
+                do {
+                    let a = try await attributes(of: item.path, fresh: true)
+                    try await opening?.value
+                    if observe(a, for: item, invalidate: false) {
+                        // Drop stale pages before the kernel reads through this
+                        // open. Bounded in case the kernel waits on this very open.
+                        let done = await boundedWait(invalidateKernelCache(item), limit: .seconds(1))
+                        if done == nil { log.error("invalidate during open timed out: \(item.path, privacy: .public)") }
+                    }
+                } catch {
+                    // The kernel won't close what it didn't get to open.
+                    _ = await opening?.result
+                    await closeHandles(item, keeping: item.withState { $0.openModes })
+                    throw error
                 }
             }
             let granted = grant(for: cacheMode)
@@ -620,8 +660,9 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
         }
     }
 
-    /// Lazily opens (and shares) the SFTP handle for reading or writing on
-    /// the given session. Handles from an older connection are reopened.
+    /// The item's SFTP handle for reading or writing on the given session,
+    /// opened if there is none (reads) or if it belongs to an older
+    /// connection. Shared by everything that uses the item.
     private func openHandle(for item: SFTPItem, write: Bool, session: Session) async throws -> Handle {
         let path = item.path
         let handle = item.withState { s -> OpenHandle in
@@ -630,7 +671,8 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             if !write, let h = s.readHandle ?? s.writeHandle, h.generation == gen { return h }
             let client = session.client
             let h = OpenHandle(generation: gen, task: Task {
-                try await client.open(path, flags: write ? [.read, .write] : .read)
+                write ? try await self.openForWriting(item, path: path, client: client)
+                      : try await client.open(path, flags: .read)
             })
             if write { s.writeHandle = h } else { s.readHandle = h }
             return h
@@ -644,6 +686,58 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
                 if s.writeHandle?.generation == handle.generation, write { s.writeHandle = nil }
             }
             throw error
+        }
+    }
+
+    /// Opens a write handle by path. If the server refuses a file the
+    /// kernel already has open for writing, the file's mode changed after
+    /// that open (created read-only, chmod) and the handle that could still
+    /// write went with a lost connection. The app's descriptor is still
+    /// good, so get a handle back the only way SFTP offers: add owner-write,
+    /// open, restore the mode. Works exactly when the file is ours, which
+    /// is when the mode never stopped us anyway. Without such an open, or
+    /// when the mode isn't what's in the way, the refusal stands.
+    private func openForWriting(_ item: SFTPItem, path: String, client: SFTPClient) async throws -> Handle {
+        func restore(_ mode: UInt32, using handle: Handle?) async throws {
+            let attributes = FileAttributes(permissions: mode)
+            if let handle { try await client.fsetstat(handle, attributes) } else { try await client.setstat(path, attributes) }
+            item.withState { $0.modeToRestore = nil }
+            table.invalidate(path)  // in case something saw the mode in between
+        }
+        let refusal: SFTPError
+        do {
+            let handle = try await client.open(path, flags: [.read, .write])
+            // A connection lost half-way through the steps below.
+            if let mode = item.withState({ $0.modeToRestore }) {
+                do { try await restore(mode, using: handle) } catch {
+                    log.error("\(path, privacy: .public): mode \(String(mode, radix: 8), privacy: .public) not restored: \(String(describing: error), privacy: .public)")
+                }
+            }
+            return handle
+        } catch let error as SFTPError where error.statusCode == .permissionDenied {
+            refusal = error
+        }
+        guard item.withState({ $0.openModes.contains(.write) }) else { throw refusal }
+        let now = try await client.lstat(path)
+        guard now.type == .regular, let permissions = now.permissions, permissions & 0o200 == 0 else { throw refusal }
+        let mode = permissions & 0o7777
+        log.notice("\(path, privacy: .public): open for writing, mode \(String(mode, radix: 8), privacy: .public); adding owner-write for the reopen")
+        // Set first: a lost connection can leave either mode behind.
+        item.withState { $0.modeToRestore = mode }
+        do {
+            try await client.setstat(path, FileAttributes(permissions: mode | 0o200))
+            let handle = try await client.open(path, flags: [.read, .write])
+            do { try await restore(mode, using: handle) } catch let error as SFTPError where !Remote.isConnectionLoss(error) {
+                log.error("\(path, privacy: .public): mode \(String(mode, radix: 8), privacy: .public) not restored: \(String(describing: error), privacy: .public)")
+                item.withState { $0.modeToRestore = nil }
+            }
+            return handle
+        } catch let error as SFTPError where Remote.isConnectionLoss(error) {
+            throw error  // the caller's retry comes back here, or to the restore above
+        } catch {
+            try? await restore(mode, using: nil)  // a no-op if the chmod was what failed
+            item.withState { $0.modeToRestore = nil }
+            throw refusal
         }
     }
 

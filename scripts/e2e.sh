@@ -54,6 +54,46 @@ check "pwrite in place"     sh -c "printf XYZ | dd of=$MNT/big.bin bs=1 seek=100
 check "small writes (4 KiB)" sh -c "dd if=/dev/zero of=$MNT/small.bin bs=4k count=2000 2>/dev/null && [ \"\$(stat -f %z $REMOTE/small.bin)\" = 8192000 ]"
 rm -f $MNT/big.bin $MNT/small.bin
 
+echo "== writing through an open descriptor, whatever the file's mode"
+# What an app may do with a file is settled when it opens it. $WORK/ro.py
+# creates FILE read-only (like git's objects) or opens it, and writes.
+print -r -- 'import os, subprocess, sys, time
+how, path = sys.argv[1], sys.argv[2]
+if how == "open":
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+else:
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o444)
+os.write(fd, b"one ")
+if how == "chmod": os.fchmod(fd, 0o444)
+if how == "reconnect":
+    os.fsync(fd)
+    subprocess.run(["pkill", "-f", "ssh -x -a -o ClearAllForwardings.*%s sftp" % sys.argv[3]])
+    time.sleep(0.5)
+os.write(fd, b"two")
+os.fsync(fd)
+os.close(fd)' > $WORK/ro.py
+is444() { [ "$(cat $1)" = "one two" ] && [ "$(stat -f %Lp $1)" = 444 ] }
+check "write to a file created read-only" sh -c "python3 $WORK/ro.py create $MNT/ro1"
+check "  ...data and mode on the server"   is444 $REMOTE/ro1
+check "chmod read-only, then write"        sh -c "python3 $WORK/ro.py chmod $MNT/ro2"
+check "  ...data and mode on the server"   is444 $REMOTE/ro2
+check "the same after a reconnect"         sh -c "python3 $WORK/ro.py reconnect $MNT/ro3 $HOST"
+check "  ...data and mode on the server"   is444 $REMOTE/ro3
+# A file the mode says we may write but the server won't let us: the
+# open must fail, not a later close (after the data went into the cache).
+echo keep > $REMOTE/locked; chflags uchg $REMOTE/locked
+check "refused by the server: open fails"  sh -c "python3 $WORK/ro.py open $MNT/locked 2>&1 | grep -q 'PermissionError.*locked'"
+check "  ...file untouched"                sh -c "[ \"\$(cat $REMOTE/locked)\" = keep ]"
+chflags nouchg $REMOTE/locked
+if git init -q $WORK/repo 2>/dev/null; then
+    (cd $WORK/repo && for i in 1 2 3; do echo $i > f$i; done && git add . && git -c user.name=e2e -c user.email=e2e@example.com commit -qm one)
+    check "git clone onto the mount"       git clone -q --no-local $WORK/repo $MNT/clone
+    check "  ...complete on the server"    sh -c "git -C $REMOTE/clone fsck --strict && [ -z \"\$(git -C $REMOTE/clone status --porcelain)\" ] && [ \"\$(cat $REMOTE/clone/f3)\" = 3 ]"
+else
+    skp "git clone" "no git"
+fi
+rm -rf $MNT/ro1 $MNT/ro2 $MNT/ro3 $MNT/locked $MNT/clone
+
 echo "== macOS metadata"
 check "xattr set/get"        sh -c "xattr -w com.example.t v $MNT/b && [ \"\$(xattr -p com.example.t $MNT/b)\" = v ]"
 check "rename onto itself keeps xattrs" sh -c "python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[1])' $MNT/b && [ \"\$(xattr -p com.example.t $MNT/b)\" = v ]"

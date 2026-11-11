@@ -89,6 +89,15 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   `fsync@openssh.com`.
 - Write-back errors surface at `close()`/`fsync()`; SFTP v3 says only
   "failure", so on write failure we statvfs and report ENOSPC when full.
+- Opens are aggregated per item: creating a file is `createItem` followed
+  by `open`; a second descriptor with more access is another `open` with
+  the union of the modes; `close` comes once, after the last descriptor
+  and mapping are gone. `mknod(2)` of a regular file is refused (EPERM)
+  before it reaches the module.
+- The kernel checks permissions itself, against the mode we report and
+  with the local user as owner, and only when an app opens a file. A write
+  through an open descriptor reaches the module later (write-back), with
+  nothing saying who opened the file or how.
 
 **Sandbox, helper and ssh** (verified 2026-11-09, dev-signed build)
 - The sandboxed extension can look up a Mach service in the user's launchd
@@ -185,6 +194,21 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   last 2 min are re-stat'ed every `dir_poll` (5 s, max 64 dirs, parallel);
   a change invalidates that directory. SFTP mtimes have 1 s resolution, so
   two changes within a second can be missed until the next change.
+- **Write handles:** an app's right to write is settled at its open, so
+  that is when the SFTP handle is settled too. `createItem` keeps the handle
+  the file was created with (it can write whatever the mode: git creates
+  its objects 0444 and then writes them), and an `open` for writing opens
+  one, alongside its lstat, if the item has none. The handle lives until
+  the item's close, so a later chmod doesn't matter, and a server that
+  won't let us write fails the app's `open(2)` instead of losing cached
+  data at close. Reads open their handle at the first read.
+  After a reconnect the handles are gone and are reopened by path at the
+  next read or write. If that is refused for a file the kernel has open for
+  writing and the mode lacks owner-write, the volume adds owner-write,
+  opens and restores the mode (`openForWriting`): the one thing here that
+  isn't exact, visible on the server for a moment, and it works exactly
+  when the file is ours. A connection lost in the middle is finished on
+  the next one.
 - **Authentication prompts:** the helper points ssh's `SSH_ASKPASS` at the
   app binary; `SSHFS_ASKPASS_MODE` in the environment (from the extension)
   switches it to askpass mode and says whether it may ask (`interactive`:
@@ -204,7 +228,8 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   remount). No dialogs in a loop, no hammering a server with failed
   logins; other authentication failures back off to 60 s.
   One reconnect loop with backoff (250 ms doubling, cap 10 s).
-  Handles carry a connection generation and reopen lazily. Idempotent calls
+  Handles carry a connection generation and are reopened at their next
+  use (see Write handles). Idempotent calls
   (stat, readdir, read, pwrite, setattr) retry once; create/remove/rename
   don't. Calls wait up to 20 s for a connection, then fail fast (ENOTCONN)
   while reconnecting continues.
