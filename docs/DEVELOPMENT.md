@@ -208,5 +208,8 @@ prompt checks are skipped without it. Accept the host key once
   groups): new files in `App/`, `Extension/`, `Shared/`, `Config/` are
   picked up automatically; `Shared/` belongs to both targets. A new target
   means editing `project.pbxproj` by hand.
+- The app icon is `App/AppIcon.icon`, an Icon Composer file (`icon.json`
+  plus SVG layers in `Assets/`); edit it in Icon Composer (inside Xcode.app)
+  or by hand. `actool` renders the glass effect at build time.
 - Don't close Finder windows with AppleScript (`close every window` closes
   all of the user's windows).
