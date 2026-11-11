@@ -59,9 +59,10 @@ The mount point is created if missing.
 
 ## Limits
 
-- Extended attributes last only until unmount. `.DS_Store` and `._*`
-  files are never written to the server: copying a folder or checking out
-  a repository that contains such files reports an error for each of them.
+- Extended attributes last only until unmount. `.DS_Store` and
+  AppleDouble (`._*`) files are never written to the server: copying a
+  folder or checking out a repository that contains such files reports an
+  error for each of them.
 - File names on the server that aren't valid UTF-8 (old Latin-1 archives)
   show up in listings with a replacement character and can't be opened.
 - Changes made on the server show up after a few seconds: new and deleted

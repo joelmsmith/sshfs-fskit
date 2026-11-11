@@ -77,6 +77,17 @@ public final class SFTPClient: Sendable {
         try await status(.setstat) { $0.string(path); $0.attributes(attributes) }
     }
 
+    /// Like `setstat`, but on a symlink itself rather than what it points
+    /// to (`lsetstat@openssh.com`).
+    public func lsetstat(_ path: String, _ attributes: FileAttributes) async throws {
+        guard supports("lsetstat@openssh.com") else {
+            throw SFTPError.status(code: StatusCode.operationUnsupported.rawValue, message: "lsetstat")
+        }
+        try await status(.extended) {
+            $0.string("lsetstat@openssh.com"); $0.string(path); $0.attributes(attributes)
+        }
+    }
+
     public func fsetstat(_ handle: Handle, _ attributes: FileAttributes) async throws {
         try await status(.fsetstat) { $0.string(handle.bytes); $0.attributes(attributes) }
     }

@@ -130,6 +130,22 @@ struct Fixture {
         #expect(a.modifyTime == 2_000_000)
     }
 
+    @Test func lsetstatChangesTheLinkNotItsTarget() async throws {
+        let f = try await Fixture()
+        defer { f.cleanup() }
+        let h = try await f.client.open(f.path("target"), flags: [.write, .create])
+        try await f.client.close(h)
+        try await f.client.setstat(f.path("target"), FileAttributes(accessTime: 1_000_000_000, modifyTime: 1_000_000_000))
+        try await f.client.symlink(target: "target", linkPath: f.path("link"))
+        try await f.client.lsetstat(f.path("link"), FileAttributes(accessTime: 1_500_000_000, modifyTime: 1_500_000_000))
+        #expect(try await f.client.lstat(f.path("link")).modifyTime == 1_500_000_000)
+        #expect(try await f.client.lstat(f.path("target")).modifyTime == 1_000_000_000)
+        // A link to nothing has attributes too.
+        try await f.client.symlink(target: "nowhere", linkPath: f.path("dangling"))
+        try await f.client.lsetstat(f.path("dangling"), FileAttributes(accessTime: 1_500_000_000, modifyTime: 1_500_000_000))
+        #expect(try await f.client.lstat(f.path("dangling")).modifyTime == 1_500_000_000)
+    }
+
     @Test func removeAndRmdir() async throws {
         let f = try await Fixture()
         defer { f.cleanup() }

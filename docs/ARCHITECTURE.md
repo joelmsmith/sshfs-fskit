@@ -189,7 +189,10 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   mount; hard links appear as separate files; IDs change across remounts.
   Ownership is shown as the local user; the server enforces permissions.
 - **Xattrs:** session-only (in memory, moved on rename, lost on unmount).
-  Creating `.DS_Store` and `._*` is refused (EACCES), so Finder doesn't
+  Creating `.DS_Store` is refused (EACCES), and so is writing AppleDouble
+  content to a `._*` name (by its magic number at the first write; the
+  empty file is removed again). Not by name: `._x.Ab12Cd` is rsync's
+  temporary file for `_x`. So Finder doesn't
   litter servers.
 - **Caches:** attributes and listings for `cache_timeout` (default 20 s);
   negative lookups from listings (Finder's AppleDouble probes made `ls -l`
@@ -222,6 +225,11 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   means a reversible mapping for invalid bytes through every place that
   builds a path. Not tested by e2e: the loopback server's APFS refuses
   such names (seen against a Linux server).
+- **Symlink attributes:** SETSTAT follows links, so times and mode of a
+  symlink (tar, rsync and `cp -a` set them) go through
+  `lsetstat@openssh.com`; without the extension they are accepted and
+  dropped rather than applied to the target. A refused mode change is
+  ignored (Linux links have no mode of their own).
 - **Append:** the kernel turns `O_APPEND` into writes at the end it knows
   of, and FSKit doesn't say a write was an append. Two machines appending
   to one file overwrite each other unless each reopens it between writes

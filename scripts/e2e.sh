@@ -40,6 +40,8 @@ check "rename"           sh -c "mv $MNT/new.txt $MNT/d/moved.txt && [ -f $REMOTE
 check "rename over"      sh -c "echo a > $MNT/a && echo b > $MNT/b && mv $MNT/a $MNT/b && [ \"\$(cat $REMOTE/b)\" = a ]"
 check "symlink"          sh -c "ln -s d/moved.txt $MNT/link && [ \"\$(readlink $REMOTE/link)\" = d/moved.txt ] && cat $MNT/link >/dev/null"
 check "symlink and hard link in a listed directory" sh -c "ls $MNT/d >/dev/null && ln -s moved.txt $MNT/d/l2 && ln $MNT/d/moved.txt $MNT/d/h2 && [ \"\$(readlink $MNT/d/l2)\" = moved.txt ] && [ -f $MNT/d/h2 ] && rm $MNT/d/l2 $MNT/d/h2"
+check "times of a symlink, not its target" sh -c "touch -h -t 201501010000 $MNT/link && [ \"\$(stat -f %Sm -t %Y $REMOTE/link)\" = 2015 ] && [ \"\$(stat -f %Sm -t %Y $REMOTE/d/moved.txt)\" != 2015 ]"
+check "times of a symlink to nothing"     sh -c "ln -s nowhere $MNT/dangling && touch -h -t 201501010000 $MNT/dangling && [ \"\$(stat -f %Sm -t %Y $REMOTE/dangling)\" = 2015 ] && rm $MNT/dangling"
 check "chmod"            sh -c "chmod 600 $MNT/b && [ \"\$(stat -f %Lp $REMOTE/b)\" = 600 ]"
 check "utimes"           sh -c "touch -t 202001010000 $MNT/b && [ \"\$(stat -f %Sm -t %Y $REMOTE/b)\" = 2020 ]"
 check "truncate"         sh -c ": > $MNT/b && [ \"\$(stat -f %z $REMOTE/b)\" = 0 ]"
@@ -100,7 +102,8 @@ check "xattr set/get"        sh -c "xattr -w com.example.t v $MNT/b && [ \"\$(xa
 check "rename onto itself keeps xattrs" sh -c "python3 -c 'import os,sys; os.rename(sys.argv[1], sys.argv[1])' $MNT/b && [ \"\$(xattr -p com.example.t $MNT/b)\" = v ]"
 check "no AppleDouble files" sh -c "! ls -a $REMOTE | grep -q '^\._'"
 check ".DS_Store refused"    sh -c "! touch $MNT/.DS_Store && [ ! -e $REMOTE/.DS_Store ]"
-check "._ names refused"     sh -c "! touch $MNT/._x"
+check "AppleDouble file refused, nothing left" sh -c "printf '\\000\\005\\026\\007\\000\\002\\000\\000' > $MNT/._b 2>/dev/null; sleep 0.5; [ ! -e $REMOTE/._b ]"
+check "other ._ names work (rsync's temporary for _x)" sh -c "echo t > $MNT/._x.Ab12Cd && mv $MNT/._x.Ab12Cd $MNT/_x && [ \"\$(cat $REMOTE/_x)\" = t ] && rm $MNT/_x"
 
 echo "== remote changes"
 if [ "$entitled" = 1 ]; then

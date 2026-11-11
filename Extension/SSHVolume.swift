@@ -305,15 +305,24 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
         return ItemTable.join(dir.path, s)
     }
 
-    /// Path for a new entry: like `path(of:_:)`, but refuses macOS metadata
-    /// files (Finder's .DS_Store, AppleDouble ._name) so they never land on
-    /// the server. Finder treats the EACCES as "can't store view settings".
+    /// Path for a new entry: like `path(of:_:)`, but refuses Finder's
+    /// .DS_Store so it never lands on the server. Finder treats the EACCES
+    /// as "can't store view settings". (AppleDouble files are refused by
+    /// content, in `write`: their `._` prefix is also how rsync names its
+    /// temporary file for `_config.yml` or `__init__.py`.)
     private func newEntryPath(in directory: FSItem, _ name: FSFileName) throws -> String {
-        if let s = name.string, s == ".DS_Store" || s.hasPrefix("._") {
+        if let s = name.string, s == ".DS_Store" {
             log.debug("refusing to create \(s, privacy: .public)")
             throw fs_errorForPOSIXError(EACCES)
         }
         return try path(of: directory, name)
+    }
+
+    /// True for the start of an AppleDouble file (extended attributes and
+    /// resource fork of the file next to it) written to a `._` name.
+    private static func isAppleDouble(_ bytes: [UInt8], at offset: off_t, path: String) -> Bool {
+        offset == 0 && bytes.starts(with: [0x00, 0x05, 0x16, 0x07])
+            && (path as NSString).lastPathComponent.hasPrefix("._")
     }
 
     // MARK: - Lookup and attributes
@@ -370,7 +379,23 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             // file's mode is now, and so may our write handle; by path the
             // server would check the mode.
             let writable = item.withState { $0.openModes.contains(.write) }
-            if detached, change != FileAttributes() {
+            if item.type == .symlink {
+                // lutimes/lchmod (tar, rsync, cp -a set a link's times).
+                // SETSTAT follows links: it would change the target, or fail
+                // for a link to nothing. Without the extension, leave it.
+                if remote.supports("lsetstat@openssh.com") {
+                    // A link's mode: macOS has one, Linux refuses to set it.
+                    if let mode = change.permissions {
+                        _ = try? await remote.run { try await $0.client.lsetstat(path, FileAttributes(permissions: mode)) }
+                        change.permissions = nil
+                    }
+                    if change != FileAttributes() {
+                        let c = change
+                        try await remote.run { try await $0.client.lsetstat(path, c) }
+                    }
+                }
+                change = FileAttributes()
+            } else if detached, change != FileAttributes() {
                 // Unlinked but open (a temporary file): only a handle reaches it.
                 let c = change
                 try await remote.run { session in
@@ -881,6 +906,17 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
         do {
             guard let item = item as? SFTPItem else { throw fs_errorForPOSIXError(EINVAL) }
             let bytes = [UInt8](contents)
+            if Self.isAppleDouble(bytes, at: offset, path: item.path) {
+                // Keep it off the server, the empty file from its create
+                // included; the open handle keeps later writes harmless.
+                let path = item.path
+                log.debug("refusing AppleDouble file \(path, privacy: .public)")
+                if (try? await remote.run(idempotent: false, { try await $0.client.remove(path) })) != nil {
+                    item.withState { $0.detached = true }
+                    table.forget(path)
+                }
+                throw fs_errorForPOSIXError(EACCES)
+            }
             // A write at an explicit offset is idempotent, so it's safe to retry
             // after a reconnect (this is what lets write-back flushes survive).
             do {
