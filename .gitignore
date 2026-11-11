@@ -1,0 +1,14 @@
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+.build/
+.swiftpm/
+*.cer
+*.provisionprofile
+*.p12
+
+# Local-only development notes (a separate, unpushed git repo) and Claude instructions
+.dev/
+CLAUDE.local.md

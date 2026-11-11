@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Per-user launchd agent, registered by the app with SMAppService
+  (copied to SSHFS.app/Contents/Library/LaunchAgents). launchd starts
+  `SSHFS helper` when the extension connects to the Mach service.
+-->
+<dict>
+	<key>Label</key>
+	<string>com.joelmsmith.sshfs.helper</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/SSHFS</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>SSHFS</string>
+		<string>helper</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.joelmsmith.sshfs.helper</key>
+		<true/>
+	</dict>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.joelmsmith.sshfs</string>
+	</array>
+</dict>
+</plist>

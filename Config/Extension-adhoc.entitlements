@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Entitlements for ad-hoc (no Apple Developer team) builds.
+  com.apple.developer.fskit.fsmodule is a restricted entitlement: AMFI kills an
+  ad-hoc signed binary that claims it. As of macOS 27.2, fskitd loads the module
+  without it, so local development works with SIP enabled.
+-->
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- The helper (SSHFS helper, a launchd agent) runs ssh outside the sandbox. -->
+	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+	<array>
+		<string>com.joelmsmith.sshfs.helper</string>
+	</array>
+</dict>
+</plist>
