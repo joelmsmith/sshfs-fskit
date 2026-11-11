@@ -249,6 +249,21 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
         return fsAttributes(a, path: path)
     }
 
+    /// A directory's attributes right after we changed its entries
+    /// ourselves. Unlike `currentAttributes` this doesn't treat the new
+    /// mtime as a change on the server: the kernel knows what it just did,
+    /// and purging its names for the directory after every create makes a
+    /// copy of many files look each one up again. The poller's baseline
+    /// stays where it was, so within `dir_poll` it sees the mtime move and
+    /// invalidates once, which also covers a change made on the server in
+    /// the same moment.
+    private func attributesAfterChange(of dir: SFTPItem) async throws -> FSItem.Attributes {
+        let path = dir.path
+        let a = try await attributes(of: path, fresh: true)
+        dir.withState { if $0.polled != nil { $0.lastAttributes = a } }
+        return fsAttributes(a, path: path)
+    }
+
     /// Records fresh attributes for an item. If the item changed on the server
     /// since we last looked (and not because we're writing to it), the kernel's
     /// cached pages -- and for a directory, its cached names, including negative
@@ -360,8 +375,12 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             if request.isValid(.size) { change.size = request.size; consumed.insert(.size) }
             if request.isValid(.mode) { change.permissions = request.mode & 0o7777; consumed.insert(.mode) }
             let detached = item.withState { $0.detached }
-            if request.isValid(.accessTime) || request.isValid(.modifyTime) {
-                // SFTP v3 sets both times together.
+            if request.isValid(.accessTime), request.isValid(.modifyTime) {
+                change.accessTime = UInt32(clamping: request.accessTime.tv_sec)
+                change.modifyTime = UInt32(clamping: request.modifyTime.tv_sec)
+                consumed.insert([.accessTime, .modifyTime])
+            } else if request.isValid(.accessTime) || request.isValid(.modifyTime) {
+                // SFTP v3 sets both times together: the other one stays.
                 let current = detached ? item.withState { $0.lastAttributes } ?? FileAttributes()
                                        : try await attributes(of: path, fresh: true)
                 change.accessTime = request.isValid(.accessTime) ? UInt32(clamping: request.accessTime.tv_sec) : current.accessTime
@@ -379,6 +398,21 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             // file's mode is now, and so may our write handle; by path the
             // server would check the mode.
             let writable = item.withState { $0.openModes.contains(.write) }
+            // A program copying a file sets the mode it already has, several
+            // times over, and truncates the file to the size it just wrote
+            // (cp: six chmods and an ftruncate per file). While we are the
+            // one writing the file, what we know of it is current: don't
+            // send what changes nothing.
+            if writable, !detached, item.type == .regular, let a = table.cachedAttributes(path) {
+                if let mode = change.permissions, a.permissions.map({ $0 & 0o7777 }) == mode { change.permissions = nil }
+                if change.accessTime != nil, change.accessTime == a.accessTime, change.modifyTime == a.modifyTime {
+                    change.accessTime = nil; change.modifyTime = nil
+                }
+                if change.size != nil, change.size == a.size, item.withState({ $0.io.writes > 0 }) { change.size = nil }
+            }
+            // Mode and times end up exactly as asked, so the result needs
+            // no lstat; a size change also moves the mtime.
+            let known = change.size == nil && !detached && item.type != .symlink ? change : nil
             if item.type == .symlink {
                 // lutimes/lchmod (tar, rsync, cp -a set a link's times).
                 // SETSTAT follows links: it would change the target, or fail
@@ -415,6 +449,14 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
                 try await remote.run { try await $0.client.setstat(path, c) }
             }
             request.consumedAttributes = consumed
+            if let known, var a = table.cachedAttributes(path) {
+                if let mode = known.permissions { a.permissions = ((a.permissions ?? 0) & ~0o7777) | mode }
+                if let time = known.accessTime { a.accessTime = time }
+                if let time = known.modifyTime { a.modifyTime = time }
+                table.cache(a, for: path)
+                item.withState { $0.lastAttributes = a }  // our change, not the server's
+                return try require(FSSetAttributesResult(attributes: fsAttributes(a, path: path), freeSpace: nil))
+            }
             if !detached { table.invalidate(path) }
             return try require(FSSetAttributesResult(attributes: try await currentAttributes(of: item, fresh: true),
                                                      freeSpace: nil))
@@ -515,13 +557,15 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
                 table.invalidate(dir.path)
                 throw fs_errorForPOSIXError(EEXIST)
             }
-            table.invalidate(dir.path)
+            table.created(path, emptyDirectory: type == .directory)
             do {
+                // Both lstats in one round trip.
+                async let directoryAttributes = attributesAfterChange(of: dir)
                 let a = try await attributes(of: path, fresh: true)
                 let item = table.item(for: path, type: a.type)
                 let result = try require(FSCreateItemResult(newItem: item, newItemName: name,
                                                             newItemAttributes: fsAttributes(a, path: path),
-                                                            directoryAttributes: try await currentAttributes(of: dir, fresh: true),
+                                                            directoryAttributes: try await directoryAttributes,
                                                             freeSpace: nil))
                 if let created {
                     // Closed by the item's close, or its reclaim if the
@@ -547,12 +591,12 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             guard let dir = directory as? SFTPItem, let target = contents.string else { throw fs_errorForPOSIXError(EINVAL) }
             let path = try newEntryPath(in: directory, name)
             try await remote.run(idempotent: false) { try await $0.client.symlink(target: target, linkPath: path) }
-            table.invalidate(dir.path)
+            table.created(path)
             let a = try await attributes(of: path, fresh: true)
             let item = table.item(for: path, type: .symlink)
             return try require(FSCreateSymlinkResult(newItem: item, newItemName: name,
                                                      newItemAttributes: fsAttributes(a, path: path),
-                                                     directoryAttributes: try await currentAttributes(of: dir, fresh: true),
+                                                     directoryAttributes: try await attributesAfterChange(of: dir),
                                                      freeSpace: nil))
         } catch { throw error.posix }
     }
@@ -565,10 +609,10 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             let existing = item.path
             try await remote.run(idempotent: false) { try await $0.client.hardlink(existing: existing, newPath: path) }
             table.invalidate(existing)
-            table.invalidate(dir.path)
+            table.created(path)
             return try require(FSCreateLinkResult(linkName: name,
                                                   linkAttributes: try await currentAttributes(of: item, fresh: true),
-                                                  directoryAttributes: try await currentAttributes(of: dir, fresh: true),
+                                                  directoryAttributes: try await attributesAfterChange(of: dir),
                                                   freeSpace: nil))
         } catch { throw error.posix }
     }
@@ -602,9 +646,8 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             }
             item.withState { $0.detached = true }
             table.forget(path)
-            table.invalidate(dir.path)
             return try require(FSRemoveItemResult(itemAttributes: before,
-                                                  directoryAttributes: try await currentAttributes(of: dir, fresh: true),
+                                                  directoryAttributes: try await attributesAfterChange(of: dir),
                                                   freeSpace: nil))
         } catch { throw error.posix }
     }
@@ -625,12 +668,10 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             try await remote.run(idempotent: false) { try await $0.client.rename(from, to: to) }
             if let over, over !== item { over.withState { $0.detached = true } }
             table.rename(from, to: to)
-            table.invalidate(src.path)
-            table.invalidate(dst.path)
             return try require(FSRenameItemResult(newName: destinationName,
                                                   renamedItemAttributes: try await currentAttributes(of: item, fresh: true),
-                                                  sourceDirectoryAttributes: try await currentAttributes(of: src, fresh: true),
-                                                  destinationDirectoryAttributes: try await currentAttributes(of: dst, fresh: true),
+                                                  sourceDirectoryAttributes: try await attributesAfterChange(of: src),
+                                                  destinationDirectoryAttributes: try await attributesAfterChange(of: dst),
                                                   overItemAttributes: overAttrs,
                                                   freeSpace: nil))
         } catch { throw error.posix }
@@ -700,7 +741,10 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
                     }
                 } : nil
                 do {
-                    let a = try await attributes(of: item.path, fresh: true)
+                    // The open that follows a create: its attributes are a
+                    // moment old and nobody else has seen the file.
+                    let justCreated = item.withState { $0.openModes.isEmpty && $0.writeHandle != nil }
+                    let a = try await attributes(of: item.path, fresh: !justCreated)
                     try await opening?.value
                     if observe(a, for: item, invalidate: false) {
                         // Drop stale pages before the kernel reads through this

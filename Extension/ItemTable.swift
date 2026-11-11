@@ -171,9 +171,30 @@ final class ItemTable: Sendable {
             s.ids.removeValue(forKey: path)
             s.attributes.removeValue(forKey: path)
             s.listings.removeValue(forKey: path)
-            s.listings.removeValue(forKey: (path as NSString).deletingLastPathComponent)
+            Self.setListed(false, path, &s)
             s.xattrs.removeValue(forKey: path)
         }
+    }
+
+    /// We created `path` ourselves (`emptyDirectory`: with mkdir, so we
+    /// know its listing too). The parent's cached listing stays in use,
+    /// with the new name in it: dropping it would make every lookup of a
+    /// name that isn't there a round trip again, and a copy of many files
+    /// does one per file.
+    func created(_ path: String, emptyDirectory: Bool = false) {
+        state.withLock { s in
+            Self.setListed(true, path, &s)
+            if emptyDirectory { s.listings[path] = ([], .now) }
+        }
+    }
+
+    /// Keeps the cached listing of `path`'s directory in step with a change
+    /// we made ourselves, and drops the directory's cached attributes.
+    private static func setListed(_ present: Bool, _ path: String, _ s: inout State) {
+        let parent = (path as NSString).deletingLastPathComponent
+        let name = (path as NSString).lastPathComponent
+        s.attributes.removeValue(forKey: parent)
+        if present { s.listings[parent]?.0.insert(name) } else { s.listings[parent]?.0.remove(name) }
     }
 
     /// Moves `from` (and everything under it) to `to`, keeping IDs.
@@ -199,9 +220,9 @@ final class ItemTable: Sendable {
                 s.items[id]?.withState { $0.path = newPath }
             }
             s.attributes = s.attributes.filter { !($0.key == from || $0.key.hasPrefix(prefix) || $0.key == to) }
-            s.listings = s.listings.filter { !($0.key == from || $0.key.hasPrefix(prefix)) }
-            s.listings.removeValue(forKey: (from as NSString).deletingLastPathComponent)
-            s.listings.removeValue(forKey: (to as NSString).deletingLastPathComponent)
+            s.listings = s.listings.filter { !($0.key == from || $0.key.hasPrefix(prefix) || $0.key == to) }
+            Self.setListed(false, from, &s)
+            Self.setListed(true, to, &s)
         }
     }
 
