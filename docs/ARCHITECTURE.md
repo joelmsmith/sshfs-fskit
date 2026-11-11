@@ -206,6 +206,19 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   won't let us write fails the app's `open(2)` instead of losing cached
   data at close. `ftruncate` goes through the same handle (`fsetstat`).
   Reads open their handle at the first read.
+- **Names going away:** an open descriptor keeps its file when it is
+  unlinked or another file is renamed over it; on the server only an open
+  handle does. So `removeItem` and `renameItem` first give a file the
+  kernel has open its handle, then mark the item detached: from then on
+  everything about it goes through the handle (`fstat`, `fsetstat`),
+  nothing is cached under its old path (which may name a new file), and
+  after a reconnect it is gone (ESTALE). The other direction, a file
+  replaced on the server: when its size or mtime is seen to change, the
+  read handle is dropped, so reads follow the name to the new file.
+- **Append:** the kernel turns `O_APPEND` into writes at the end it knows
+  of, and FSKit doesn't say a write was an append. Two machines appending
+  to one file overwrite each other unless each reopens it between writes
+  (an open revalidates the size). Same as sshfs.
   After a reconnect the handles are gone and are reopened by path at the
   next read or write. If that is refused for a file the kernel has open for
   writing and the mode lacks owner-write, the volume adds owner-write,

@@ -111,9 +111,10 @@ self-service). The scripts read from `SIGNING_DIR` (default
 
 ## Tests
 
-- **`scripts/e2e.sh`**: 68 checks against the installed app over loopback
+- **`scripts/e2e.sh`**: 72 checks against the installed app over loopback
   ssh: file operations, data integrity, writes to read-only files through
-  an open descriptor (and `git clone`), xattrs, refused metadata files,
+  an open descriptor (and `git clone`), descriptors whose name was
+  unlinked or replaced, xattrs, refused metadata files,
   remote-change freshness (team-signed builds only), reconnect, ssh
   setups that need the helper (an agent socket under `~/Library`,
   `IdentityAgent`, `ProxyJump`, list-valued ssh options), and prompts

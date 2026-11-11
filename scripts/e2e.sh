@@ -117,6 +117,35 @@ else
     skp "remote-change tests" "ad-hoc build has no kernel cache invalidation"
 fi
 
+# A descriptor keeps its file when the name goes away or goes to another file.
+print -r -- 'import os, sys
+case, mnt, remote = sys.argv[1:]
+def put(path, data):
+    with open(path, "wb") as f: f.write(data)
+old, new = b"old" * 50000, b"new" * 40000
+if case == "unlink":       # read-only descriptor, nothing read yet
+    put(remote + "/k", old); fd = os.open(mnt + "/k", os.O_RDONLY); os.unlink(mnt + "/k")
+    ok = os.read(fd, len(old)) == old and os.fstat(fd).st_size == len(old)
+elif case == "tmpfile":    # unlinked, then written, resized and read back
+    fd = os.open(mnt + "/t", os.O_CREAT | os.O_RDWR, 0o600); os.unlink(mnt + "/t")
+    put(remote + "/t", new)   # the name is someone else\x27s now
+    os.write(fd, old); os.ftruncate(fd, 6); os.fchmod(fd, 0o400); os.fsync(fd)
+    ok = os.pread(fd, 100, 0) == b"oldold" and os.fstat(fd).st_size == 6 and open(remote + "/t", "rb").read() == new
+elif case == "save":       # atomic save under a reader that has not read yet
+    put(remote + "/s", old); put(mnt + "/s.tmp", new)
+    fd = os.open(mnt + "/s", os.O_RDONLY); os.rename(mnt + "/s.tmp", mnt + "/s")
+    ok = os.read(fd, len(old)) == old and open(mnt + "/s", "rb").read() == new
+elif case == "replaced":   # replaced on the server while open here: a new open reads the new file
+    import time
+    put(remote + "/r", old); fd = os.open(mnt + "/r", os.O_RDONLY); os.read(fd, 10)
+    put(remote + "/r.new", new); os.rename(remote + "/r.new", remote + "/r"); time.sleep(1.2)
+    ok = open(mnt + "/r", "rb").read() == new
+sys.exit(0 if ok else 1)' > $WORK/names.py
+check "open, unlink, then read"                 python3 $WORK/names.py unlink $MNT/sub $REMOTE/sub
+check "temporary file: unlinked, written, resized, read" python3 $WORK/names.py tmpfile $MNT/sub $REMOTE/sub
+check "atomic save under an open reader"        python3 $WORK/names.py save $MNT/sub $REMOTE/sub
+check "replaced on the server while open here"  python3 $WORK/names.py replaced $MNT/sub $REMOTE/sub
+
 # A lock file or directory another machine took after we listed the
 # directory: the kernel thinks the name is free, the create must say EEXIST.
 excl() { python3 -c 'import os, sys, errno

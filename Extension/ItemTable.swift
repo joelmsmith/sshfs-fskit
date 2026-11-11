@@ -40,6 +40,10 @@ final class SFTPItem: FSItem, @unchecked Sendable {
         /// The file's mode while it has owner-write added to get a write
         /// handle back (SSHVolume.openForWriting); nil once it's restored.
         var modeToRestore: UInt32?
+        /// The file was removed or renamed over while open: `path` no
+        /// longer names it (and may name a new file). Only its handles
+        /// reach it now; nothing about it is done or cached by path.
+        var detached = false
         var openModes: FSVolume.OpenModes = []
         /// What the kernel was last allowed to cache for this item.
         var cacheMode: FSVolume.DataCacheMode = .none

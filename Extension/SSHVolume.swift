@@ -231,6 +231,19 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
 
     private func currentAttributes(of item: SFTPItem, fresh: Bool = false) async throws -> FSItem.Attributes {
         let path = item.path
+        if item.withState({ $0.detached }) {
+            // fstat: the path is someone else's now.
+            var a = item.withState { $0.lastAttributes }
+            if fresh || a == nil {
+                let write = item.withState { $0.openModes.contains(.write) }
+                let now = try await remote.run { session in
+                    try await session.client.fstat(try await self.openHandle(for: item, write: write, session: session))
+                }
+                item.withState { $0.lastAttributes = now }
+                a = now
+            }
+            return a!.fsAttributes(id: item.id, parentID: table.parentID(of: path))
+        }
         let a = try await attributes(of: path, fresh: fresh)
         observe(a, for: item)
         return fsAttributes(a, path: path)
@@ -245,7 +258,11 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
         let changed = item.withState { s -> Bool in
             defer { s.lastAttributes = a; s.type = a.type }
             guard let old = s.lastAttributes, s.io.writes == 0 else { return false }
-            return old.modifyTime != a.modifyTime || old.size != a.size
+            guard old.modifyTime != a.modifyTime || old.size != a.size else { return false }
+            // It may be another file now (replaced by a rename on the
+            // server): a handle opened before would keep reading the old one.
+            if let h = s.readHandle { s.retired.append(h); s.readHandle = nil }
+            return true
         }
         if changed && invalidate { invalidateKernelCache(item) }
         return changed
@@ -333,9 +350,11 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             var consumed: FSItem.Attribute = []
             if request.isValid(.size) { change.size = request.size; consumed.insert(.size) }
             if request.isValid(.mode) { change.permissions = request.mode & 0o7777; consumed.insert(.mode) }
+            let detached = item.withState { $0.detached }
             if request.isValid(.accessTime) || request.isValid(.modifyTime) {
                 // SFTP v3 sets both times together.
-                let current = try await attributes(of: path, fresh: true)
+                let current = detached ? item.withState { $0.lastAttributes } ?? FileAttributes()
+                                       : try await attributes(of: path, fresh: true)
                 change.accessTime = request.isValid(.accessTime) ? UInt32(clamping: request.accessTime.tv_sec) : current.accessTime
                 change.modifyTime = request.isValid(.modifyTime) ? UInt32(clamping: request.modifyTime.tv_sec) : current.modifyTime
                 if request.isValid(.accessTime) { consumed.insert(.accessTime) }
@@ -350,7 +369,16 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             // ftruncate(2): the descriptor may change the size whatever the
             // file's mode is now, and so may our write handle; by path the
             // server would check the mode.
-            if let size = change.size, item.type == .regular, item.withState({ $0.openModes.contains(.write) }) {
+            let writable = item.withState { $0.openModes.contains(.write) }
+            if detached, change != FileAttributes() {
+                // Unlinked but open (a temporary file): only a handle reaches it.
+                let c = change
+                try await remote.run { session in
+                    let h = try await self.openHandle(for: item, write: writable, session: session)
+                    try await session.client.fsetstat(h, c)
+                }
+                change = FileAttributes()
+            } else if let size = change.size, item.type == .regular, writable {
                 try await remote.run { session in
                     let h = try await self.openHandle(for: item, write: true, session: session)
                     try await session.client.fsetstat(h, FileAttributes(size: size))
@@ -362,7 +390,7 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
                 try await remote.run { try await $0.client.setstat(path, c) }
             }
             request.consumedAttributes = consumed
-            table.invalidate(path)
+            if !detached { table.invalidate(path) }
             return try require(FSSetAttributesResult(attributes: try await currentAttributes(of: item, fresh: true),
                                                      freeSpace: nil))
         } catch { throw error.posix }
@@ -536,6 +564,7 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             guard let item = item as? SFTPItem, let dir = directory as? SFTPItem else { throw fs_errorForPOSIXError(EINVAL) }
             let path = item.path
             let before = try await currentAttributes(of: item)
+            await holdBeforeDetaching(item)
             if item.type == .directory {
                 do {
                     try await remote.run(idempotent: false) { try await $0.client.rmdir(path) }
@@ -546,6 +575,7 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             } else {
                 try await remote.run(idempotent: false) { try await $0.client.remove(path) }
             }
+            item.withState { $0.detached = true }
             table.forget(path)
             table.invalidate(dir.path)
             return try require(FSRemoveItemResult(itemAttributes: before,
@@ -565,7 +595,10 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             let overAttrs: FSItem.Attributes? = if let over = overItem as? SFTPItem {
                 try? await currentAttributes(of: over)
             } else { nil }
+            let over = overItem as? SFTPItem
+            if let over, over !== item { await holdBeforeDetaching(over) }
             try await remote.run(idempotent: false) { try await $0.client.rename(from, to: to) }
+            if let over, over !== item { over.withState { $0.detached = true } }
             table.rename(from, to: to)
             table.invalidate(src.path)
             table.invalidate(dst.path)
@@ -576,6 +609,17 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
                                                   overItemAttributes: overAttrs,
                                                   freeSpace: nil))
         } catch { throw error.posix }
+    }
+
+    /// An open descriptor keeps its file when the name goes away (unlink,
+    /// or another file renamed over it); on the server only an open handle
+    /// does that. So before the name goes, a file the kernel has open gets
+    /// its handle if it has none yet (reads open theirs late).
+    private func holdBeforeDetaching(_ item: SFTPItem) async {
+        guard item.type == .regular, item.withState({ !$0.openModes.isEmpty && !$0.detached }) else { return }
+        _ = try? await remote.run { session in
+            try await self.openHandle(for: item, write: false, session: session)
+        }
     }
 
     // MARK: - Extended attributes (session-only, in memory)
@@ -685,10 +729,12 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
     /// connection. Shared by everything that uses the item.
     private func openHandle(for item: SFTPItem, write: Bool, session: Session) async throws -> Handle {
         let path = item.path
-        let handle = item.withState { s -> OpenHandle in
+        let handle = try item.withState { s -> OpenHandle in
             let gen = session.generation
             if write, let h = s.writeHandle, h.generation == gen { return h }
             if !write, let h = s.readHandle ?? s.writeHandle, h.generation == gen { return h }
+            // The handles went with a lost connection and the file has no name.
+            if s.detached { throw fs_errorForPOSIXError(ESTALE) }
             let client = session.client
             let h = OpenHandle(generation: gen, task: Task {
                 write ? try await self.openForWriting(item, path: path, client: client)
@@ -864,10 +910,11 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             item.withState { $0.io.writes += 1; $0.io.writtenBytes += bytes.count; $0.io.largestWrite = max($0.io.largestWrite, bytes.count) }
             // Keep the cached size in step so the kernel doesn't see a stale EOF.
             let path = item.path
-            if var a = table.cachedAttributes(path) ?? item.withState({ $0.lastAttributes }) {
+            let detached = item.withState { $0.detached }
+            if var a = (detached ? nil : table.cachedAttributes(path)) ?? item.withState({ $0.lastAttributes }) {
                 a.size = max(a.size ?? 0, UInt64(offset) + UInt64(contents.count))
                 a.modifyTime = UInt32(clamping: Int(Date().timeIntervalSince1970))
-                table.cache(a, for: path)
+                if !detached { table.cache(a, for: path) }
                 item.withState { $0.lastAttributes = a }
             }
             return try require(FSWriteFileResult(bytesWritten: contents.count,
