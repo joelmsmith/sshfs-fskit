@@ -79,6 +79,7 @@ check "chmod read-only, then write"        sh -c "python3 $WORK/ro.py chmod $MNT
 check "  ...data and mode on the server"   is444 $REMOTE/ro2
 check "the same after a reconnect"         sh -c "python3 $WORK/ro.py reconnect $MNT/ro3 $HOST"
 check "  ...data and mode on the server"   is444 $REMOTE/ro3
+check "ftruncate through it"               sh -c "python3 -c 'import os,sys; fd = os.open(sys.argv[1], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o444); os.write(fd, b\"0123456789\"); os.ftruncate(fd, 4); os.close(fd)' $MNT/ro4 && [ \"\$(cat $REMOTE/ro4)\" = 0123 ]"
 # A file the mode says we may write but the server won't let us: the
 # open must fail, not a later close (after the data went into the cache).
 echo keep > $REMOTE/locked; chflags uchg $REMOTE/locked
@@ -92,7 +93,7 @@ if git init -q $WORK/repo 2>/dev/null; then
 else
     skp "git clone" "no git"
 fi
-rm -rf $MNT/ro1 $MNT/ro2 $MNT/ro3 $MNT/locked $MNT/clone
+rm -rf $MNT/ro1 $MNT/ro2 $MNT/ro3 $MNT/ro4 $MNT/locked $MNT/clone
 
 echo "== macOS metadata"
 check "xattr set/get"        sh -c "xattr -w com.example.t v $MNT/b && [ \"\$(xattr -p com.example.t $MNT/b)\" = v ]"
@@ -115,6 +116,16 @@ if [ "$entitled" = 1 ]; then
 else
     skp "remote-change tests" "ad-hoc build has no kernel cache invalidation"
 fi
+
+# A lock file or directory another machine took after we listed the
+# directory: the kernel thinks the name is free, the create must say EEXIST.
+excl() { python3 -c 'import os, sys, errno
+try: os.mkdir(sys.argv[2]) if sys.argv[1] == "dir" else os.close(os.open(sys.argv[2], os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+except OSError as e: sys.exit(0 if e.errno == errno.EEXIST else 1)
+sys.exit(1)' $1 $2 }
+ls $MNT/sub >/dev/null; touch $REMOTE/sub/lock; mkdir $REMOTE/sub/lockdir
+check "O_EXCL create of a name made on the server: EEXIST" excl file $MNT/sub/lock
+check "mkdir of a name made on the server: EEXIST"         excl dir $MNT/sub/lockdir
 
 echo "== reconnect"
 pkill -f "ssh -x -a -o ClearAllForwardings.*$HOST sftp"; sleep 0.5

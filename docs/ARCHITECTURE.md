@@ -89,6 +89,9 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   `fsync@openssh.com`.
 - Write-back errors surface at `close()`/`fsync()`; SFTP v3 says only
   "failure", so on write failure we statvfs and report ENOSPC when full.
+  Likewise a failed create or mkdir is followed by an lstat, to report
+  EEXIST for a name that appeared on the server after the kernel (or our
+  listing cache) saw it free.
 - Opens are aggregated per item: creating a file is `createItem` followed
   by `open`; a second descriptor with more access is another `open` with
   the union of the modes; `close` comes once, after the last descriptor
@@ -201,7 +204,8 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   one, alongside its lstat, if the item has none. The handle lives until
   the item's close, so a later chmod doesn't matter, and a server that
   won't let us write fails the app's `open(2)` instead of losing cached
-  data at close. Reads open their handle at the first read.
+  data at close. `ftruncate` goes through the same handle (`fsetstat`).
+  Reads open their handle at the first read.
   After a reconnect the handles are gone and are reopened by path at the
   next read or write. If that is refused for a file the kernel has open for
   writing and the mode lacks owner-write, the volume adds owner-write,

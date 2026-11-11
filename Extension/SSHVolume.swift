@@ -347,6 +347,16 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             if request.isValid(.gid) { consumed.insert(.gid) }
             if request.isValid(.flags) { consumed.insert(.flags) }
 
+            // ftruncate(2): the descriptor may change the size whatever the
+            // file's mode is now, and so may our write handle; by path the
+            // server would check the mode.
+            if let size = change.size, item.type == .regular, item.withState({ $0.openModes.contains(.write) }) {
+                try await remote.run { session in
+                    let h = try await self.openHandle(for: item, write: true, session: session)
+                    try await session.client.fsetstat(h, FileAttributes(size: size))
+                }
+                change.size = nil
+            }
             if change != FileAttributes() {
                 let c = change
                 try await remote.run { try await $0.client.setstat(path, c) }
@@ -428,19 +438,29 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             // kept for the open that follows; a later open by path would be
             // refused.
             var created: OpenHandle?
-            switch type {
-            case .file:
-                created = try await remote.run(idempotent: false) {
-                    let h = try await $0.client.open(path, flags: [.read, .write, .create, .exclusive],
-                                                     attributes: FileAttributes(permissions: mode ?? 0o644))
-                    return OpenHandle(generation: $0.generation, handle: h)
+            do {
+                switch type {
+                case .file:
+                    created = try await remote.run(idempotent: false) {
+                        let h = try await $0.client.open(path, flags: [.read, .write, .create, .exclusive],
+                                                         attributes: FileAttributes(permissions: mode ?? 0o644))
+                        return OpenHandle(generation: $0.generation, handle: h)
+                    }
+                case .directory:
+                    try await remote.run(idempotent: false) {
+                        try await $0.client.mkdir(path, attributes: FileAttributes(permissions: mode ?? 0o755))
+                    }
+                default:
+                    throw fs_errorForPOSIXError(ENOTSUP)
                 }
-            case .directory:
-                try await remote.run(idempotent: false) {
-                    try await $0.client.mkdir(path, attributes: FileAttributes(permissions: mode ?? 0o755))
-                }
-            default:
-                throw fs_errorForPOSIXError(ENOTSUP)
+            } catch let error as SFTPError where error.statusCode == .failure {
+                // SFTP v3 has no "exists". The kernel only gets here when it
+                // (or our listing cache) believes the name is free, so a name
+                // made on the server meanwhile lands here: programs taking
+                // lock files need to see EEXIST.
+                guard (try? await attributes(of: path, fresh: true)) != nil else { throw error }
+                table.invalidate(dir.path)
+                throw fs_errorForPOSIXError(EEXIST)
             }
             table.invalidate(dir.path)
             do {
