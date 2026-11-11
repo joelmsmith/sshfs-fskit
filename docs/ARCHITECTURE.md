@@ -215,6 +215,13 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   after a reconnect it is gone (ESTALE). The other direction, a file
   replaced on the server: when its size or mtime is seen to change, the
   read handle is dropped, so reads follow the name to the new file.
+- **Names:** paths are Swift strings, and names from the server are
+  decoded as UTF-8 with replacement characters
+  (`DirectoryEntry.filename`), so a name with other bytes is listed but
+  can't be found again: lookup sends the replacement character. Fixing it
+  means a reversible mapping for invalid bytes through every place that
+  builds a path. Not tested by e2e: the loopback server's APFS refuses
+  such names (seen against a Linux server).
 - **Append:** the kernel turns `O_APPEND` into writes at the end it knows
   of, and FSKit doesn't say a write was an append. Two machines appending
   to one file overwrite each other unless each reopens it between writes
