@@ -196,7 +196,20 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   litter servers.
 - **Caches:** attributes and listings for `cache_timeout` (default 20 s);
   negative lookups from listings (Finder's AppleDouble probes made `ls -l`
-  of 5000 files take 47 s without it). Directories the kernel used in the
+  of 5000 files take 47 s without it). Our own creates, removes and
+  renames edit the cached listing rather than drop it, and a directory we
+  made starts with an empty one, so a copy of many files doesn't pay a
+  round trip per absent name; they also don't make the kernel purge the
+  directory (the poller does, at most once per interval, which covers a
+  server-side change made at the same moment).
+  Round trips are what small files cost (see the table below), so calls
+  avoid lstats whose answer is known: create fetches the file's and the
+  directory's together, the open after a create and mode/time changes
+  reuse what they have, a rename carries the item's attributes along, and
+  while a file is open for writing a chmod to its current mode or an
+  ftruncate to its current size isn't sent (cp does six and one per
+  file). Times are always sent: the cached mtime of a file being written
+  is a guess from our clock. Directories the kernel used in the
   last 2 min are re-stat'ed every `dir_poll` (5 s, max 64 dirs, parallel);
   a change invalidates that directory. SFTP mtimes have 1 s resolution, so
   two changes within a second can be missed until the next change.
@@ -281,6 +294,7 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
 | 106 MB read, kernel cache disabled | 10.8 s |
 | 64 MB write, 4 KiB / 1 MiB blocks (write-back) | 79 / 100 MB/s |
 | Cold `ls -l`, 5000 files | 1.0 s |
+| Small files, per file (2026-11-10): `cp -R` / `rsync -a` / `tar x` / `rm -rf` | 45 / 56 / 100 / 14 ms |
 | Mount | ~0.4 s |
 
 The kernel issues uncached lookups serially, so latency, not bandwidth, is

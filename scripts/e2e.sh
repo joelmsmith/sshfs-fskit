@@ -82,6 +82,7 @@ check "  ...data and mode on the server"   is444 $REMOTE/ro2
 check "the same after a reconnect"         sh -c "python3 $WORK/ro.py reconnect $MNT/ro3 $HOST"
 check "  ...data and mode on the server"   is444 $REMOTE/ro3
 check "ftruncate through it"               sh -c "python3 -c 'import os,sys; fd = os.open(sys.argv[1], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o444); os.write(fd, b\"0123456789\"); os.ftruncate(fd, 4); os.close(fd)' $MNT/ro4 && [ \"\$(cat $REMOTE/ro4)\" = 0123 ]"
+check "write, set times, close: times stay (tar, cp -p)" sh -c "python3 -c 'import os,sys; fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o644); os.write(fd, b\"x\" * 300000); os.utime(fd, (1577836800, 1577836800)); os.close(fd)' $MNT/timed && sleep 0.3 && [ \"\$(stat -f %m $REMOTE/timed)\" = 1577836800 ] && [ \"\$(stat -f %m $MNT/timed)\" = 1577836800 ] && rm $MNT/timed"
 # A file the mode says we may write but the server won't let us: the
 # open must fail, not a later close (after the data went into the cache).
 echo keep > $REMOTE/locked; chflags uchg $REMOTE/locked

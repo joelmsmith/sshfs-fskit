@@ -401,13 +401,11 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             // A program copying a file sets the mode it already has, several
             // times over, and truncates the file to the size it just wrote
             // (cp: six chmods and an ftruncate per file). While we are the
-            // one writing the file, what we know of it is current: don't
-            // send what changes nothing.
+            // one writing the file we know its mode and size: don't send
+            // what changes nothing. (Not so for times: the cached mtime of
+            // a file being written is our clock's guess.)
             if writable, !detached, item.type == .regular, let a = table.cachedAttributes(path) {
                 if let mode = change.permissions, a.permissions.map({ $0 & 0o7777 }) == mode { change.permissions = nil }
-                if change.accessTime != nil, change.accessTime == a.accessTime, change.modifyTime == a.modifyTime {
-                    change.accessTime = nil; change.modifyTime = nil
-                }
                 if change.size != nil, change.size == a.size, item.withState({ $0.io.writes > 0 }) { change.size = nil }
             }
             // Mode and times end up exactly as asked, so the result needs
@@ -668,10 +666,14 @@ final class SSHVolume: FSVolume, FSVolume.Handler, FSVolume.DataCacheHandler,
             try await remote.run(idempotent: false) { try await $0.client.rename(from, to: to) }
             if let over, over !== item { over.withState { $0.detached = true } }
             table.rename(from, to: to)
+            // A rename leaves the item's own attributes as they were (the
+            // table moved them along); the directories are fetched together.
+            async let sourceAttributes = attributesAfterChange(of: src)
+            let destinationAttributes = src === dst ? try await sourceAttributes : try await attributesAfterChange(of: dst)
             return try require(FSRenameItemResult(newName: destinationName,
-                                                  renamedItemAttributes: try await currentAttributes(of: item, fresh: true),
-                                                  sourceDirectoryAttributes: try await attributesAfterChange(of: src),
-                                                  destinationDirectoryAttributes: try await attributesAfterChange(of: dst),
+                                                  renamedItemAttributes: try await currentAttributes(of: item),
+                                                  sourceDirectoryAttributes: try await sourceAttributes,
+                                                  destinationDirectoryAttributes: destinationAttributes,
                                                   overItemAttributes: overAttrs,
                                                   freeSpace: nil))
         } catch { throw error.posix }

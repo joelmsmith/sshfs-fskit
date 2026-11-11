@@ -219,7 +219,9 @@ final class ItemTable: Sendable {
                 s.ids[newPath] = id
                 s.items[id]?.withState { $0.path = newPath }
             }
+            let moved = s.attributes[from]
             s.attributes = s.attributes.filter { !($0.key == from || $0.key.hasPrefix(prefix) || $0.key == to) }
+            s.attributes[to] = moved
             s.listings = s.listings.filter { !($0.key == from || $0.key.hasPrefix(prefix) || $0.key == to) }
             Self.setListed(false, from, &s)
             Self.setListed(true, to, &s)
