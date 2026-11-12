@@ -20,7 +20,7 @@ ok()   { print -P "%F{green}PASS%f $1"; ((pass++)) }
 bad()  { print -P "%F{red}FAIL%f $1${2:+ — $2}"; ((fail++)) }
 skp()  { print -P "%F{yellow}SKIP%f $1${2:+ — $2}"; ((skip++)) }
 check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name"; fi }
-cleanup() { umount $MNT 2>/dev/null || umount -f $MNT 2>/dev/null; rm -rf $WORK; }
+cleanup() { rm -f ~/.ssh/sshfs-flaky-down; umount $MNT 2>/dev/null || umount -f $MNT 2>/dev/null; rm -rf $WORK; }
 trap cleanup EXIT
 
 ssh -o BatchMode=yes -o ConnectTimeout=5 $HOST true || { echo "ssh $HOST doesn't work; see docs/DEVELOPMENT.md"; exit 2; }
@@ -170,8 +170,26 @@ start=$(date +%s)
 check "heals a silently dead connection" sh -c "[ \"\$(cat $MNT/sub/frozen.txt)\" = frozen ]"
 echo "     (took $(( $(date +%s) - start )) s)"
 
+echo "== mounting where sshfs is already mounted"
+check "replaces the mount" sh -c "$SSHFS '$HOST:$REMOTE/sub' $MNT && [ -f $MNT/hello.txt ]"
+check "...unless it's in use" sh -c "cd $MNT && ! $SSHFS '$HOST:$REMOTE' $MNT && [ -f hello.txt ]"
+
 echo "== unmount"
 check "umount" umount $MNT
+
+# A mount that lost its server fails every call, stat of the mount point
+# included; sshfs must still be able to mount there again.
+if ssh -o ConnectTimeout=5 sshfs-flaky true 2>/dev/null; then
+    ${=SSHFS} "sshfs-flaky:$REMOTE" $MNT
+    touch ~/.ssh/sshfs-flaky-down; pkill -f "ssh .*sshfs-flaky"
+    for i in {1..40}; do stat $MNT >/dev/null 2>&1 || break; sleep 1; done
+    check "a mount without its server stops answering" sh -c "! stat $MNT"
+    rm -f ~/.ssh/sshfs-flaky-down
+    check "sshfs replaces it" sh -c "$SSHFS 'sshfs-flaky:$REMOTE' $MNT && [ -d $MNT/sub ]"
+    umount $MNT 2>/dev/null
+else
+    skp "replacing a disconnected mount" "no Host sshfs-flaky (see docs/DEVELOPMENT.md)"
+fi
 
 echo "== ssh setups (ssh runs in the helper, outside the sandbox)"
 # An agent whose socket lives where a sandboxed process couldn't reach it,

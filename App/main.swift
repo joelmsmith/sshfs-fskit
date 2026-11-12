@@ -70,6 +70,28 @@ func parseRemote(_ spec: String) -> (user: String?, host: String, path: String)?
     return (user, String(host), String(rest.dropFirst()))
 }
 
+/// What the sshfs mount at `path` is a mount of, if there is one. Asks the
+/// mount table rather than the mount, which may be slow or failing to answer.
+func sshfsMount(at path: String) -> String? {
+    let url = URL(fileURLWithPath: path).standardizedFileURL
+    guard let parent = realpath(url.deletingLastPathComponent().path, nil) else { return nil }
+    defer { free(parent) }
+    let resolved = URL(fileURLWithPath: String(cString: parent)).appendingPathComponent(url.lastPathComponent).path
+    var mounts: UnsafeMutablePointer<statfs>?
+    let count = getmntinfo_r_np(&mounts, MNT_NOWAIT)
+    defer { free(mounts) }
+    func string<T>(_ field: T) -> String {
+        withUnsafeBytes(of: field) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+    }
+    for i in 0..<Int(max(count, 0)) {
+        let m = mounts![i]
+        guard string(m.f_fstypename) == "sshfs", string(m.f_mntonname) == resolved else { continue }
+        let from = string(m.f_mntfromname)
+        return String(from.prefix { $0 != "?" })
+    }
+    return nil
+}
+
 /// The helper's launchd agent (Contents/Library/LaunchAgents in the app).
 let helperService = SMAppService.agent(plistName: helperPlistName)
 
@@ -234,6 +256,22 @@ func sshfs(_ args: [String]) async -> Never {
     guard let url = c.url else { fail("can't build a URL from \(positional[0])") }
 
     let mountpoint = positional[1]
+    // Mounting where sshfs is already mounted replaces that mount. It has to
+    // for a mount whose server went away: every call on it, stat included,
+    // fails with ENOTCONN, so the mount point neither "exists" nor can be
+    // created or removed. (Its cached attributes can still answer for a
+    // while, so there's no telling such a mount from a healthy one here.)
+    // Not forced: a mount in use, or with data it couldn't save, stays.
+    if let old = sshfsMount(at: mountpoint) {
+        if unmount(mountpoint, 0) != 0 {
+            fail("""
+                \(mountpoint) is already an sshfs mount of \(old), and it won't unmount \
+                (\(String(cString: strerror(errno)))). If it lost its server, `SSHFS check` makes it try again; \
+                `umount -f \(mountpoint)` removes it, discarding anything it hadn't saved.
+                """)
+        }
+        FileHandle.standardError.write(Data("sshfs: replacing the mount of \(old)\n".utf8))
+    }
     var isDir: ObjCBool = false
     var created = false
     if !FileManager.default.fileExists(atPath: mountpoint, isDirectory: &isDir) {

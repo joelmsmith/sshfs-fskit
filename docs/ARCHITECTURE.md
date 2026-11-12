@@ -278,6 +278,11 @@ helper (App/Helper.swift: the app binary run as `SSHFS helper`, unsandboxed,
   (stat, readdir, read, pwrite, setattr) retry once; create/remove/rename
   don't. Calls wait up to 20 s for a connection, then fail fast (ENOTCONN)
   while reconnecting continues.
+  That includes stat of the mount point once the root's cached attributes
+  expire, so to the shell it neither exists nor can be created or removed.
+  `sshfs` therefore looks its mount point up in the mount table, not the
+  file system, and replaces an sshfs mount it finds there (plain
+  `unmount(2)`: one in use or with unsaved data stays, with a message).
 - **Liveness:** a request unanswered for 5 s, a network path change
   (NWPathMonitor), a detected sleep (ContinuousClock vs SuspendingClock gap)
   or `SSHFS check` (Darwin notification `com.joelmsmith.sshfs.check`)

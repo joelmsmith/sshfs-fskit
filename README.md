@@ -30,6 +30,10 @@ sshfs user@host: ~/mnt/home -o IdentityFile=~/.ssh/id_work,cache_timeout=5
 umount ~/mnt/music
 ```
 
+Mounting where sshfs is already mounted replaces that mount, if nothing is
+using it: the way to recover one whose server went away ("Socket is not
+connected").
+
 Options (`-o`, comma-separated):
 
 | Option | Meaning |
