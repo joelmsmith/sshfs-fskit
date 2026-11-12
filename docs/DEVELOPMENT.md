@@ -202,6 +202,9 @@ prompt checks are skipped without it. Accept the host key once
   invalidated.
 - Inside the extension `~` is its container: use absolute paths in tests.
 - A mount whose dirty data the server refuses won't unmount: `umount -f`.
+- `umount` of a mount that lost its server needs the absolute path: with a
+  relative one it says "not currently mounted" (it can't resolve the path
+  through a mount that fails every call).
 - SourceKit diagnostics in editors ("No such module 'SFTP'") are noise;
   trust `xcodebuild`.
 - The project file is hand-written (`objectVersion` 77, synchronized folder

@@ -72,7 +72,9 @@ func parseRemote(_ spec: String) -> (user: String?, host: String, path: String)?
 
 /// What the sshfs mount at `path` is a mount of, if there is one. Asks the
 /// mount table rather than the mount, which may be slow or failing to answer.
-func sshfsMount(at path: String) -> String? {
+/// `path` in the result is absolute: umount(8) only finds a mount that
+/// doesn't answer by its full path ("not currently mounted" otherwise).
+func sshfsMount(at path: String) -> (source: String, path: String)? {
     let url = URL(fileURLWithPath: path).standardizedFileURL
     guard let parent = realpath(url.deletingLastPathComponent().path, nil) else { return nil }
     defer { free(parent) }
@@ -87,7 +89,7 @@ func sshfsMount(at path: String) -> String? {
         let m = mounts![i]
         guard string(m.f_fstypename) == "sshfs", string(m.f_mntonname) == resolved else { continue }
         let from = string(m.f_mntfromname)
-        return String(from.prefix { $0 != "?" })
+        return (String(from.prefix { $0 != "?" }), resolved)
     }
     return nil
 }
@@ -262,12 +264,12 @@ func sshfs(_ args: [String]) async -> Never {
     // created or removed. (Its cached attributes can still answer for a
     // while, so there's no telling such a mount from a healthy one here.)
     // Not forced: a mount in use, or with data it couldn't save, stays.
-    if let old = sshfsMount(at: mountpoint) {
+    if let (old, fullPath) = sshfsMount(at: mountpoint) {
         if unmount(mountpoint, 0) != 0 {
             fail("""
                 \(mountpoint) is already an sshfs mount of \(old), and it won't unmount \
                 (\(String(cString: strerror(errno)))). If it lost its server, `SSHFS check` makes it try again; \
-                `umount -f \(mountpoint)` removes it, discarding anything it hadn't saved.
+                `umount -f \(fullPath)` removes it, discarding anything it hadn't saved.
                 """)
         }
         FileHandle.standardError.write(Data("sshfs: replacing the mount of \(old)\n".utf8))
